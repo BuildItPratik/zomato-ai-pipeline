@@ -6,6 +6,9 @@ import snowflake.connector
 from google import genai
 from google.genai import types
 from dotenv import load_dotenv
+import time
+
+
 
 load_dotenv()
 
@@ -14,6 +17,8 @@ CHAT_MODEL = "gemini-3.6-flash"
 NEW_REVIEWS = 500
 TOK_K = 5
 CACHE_FILE = "review_embeddings.parquet"
+EMBED_BATCH_SIZE = 100
+EMBED_RETRY_LIMIT = 5
 
 client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
@@ -38,12 +43,32 @@ def read_reviews_from_snowflake():
     df.columns = [col.lower() for col in df.columns]
     return df
 
+
+
 def embed(texts):
-    result = client.models.embed_content(
-        model=EMBEDDING_MODEL,
-        contents=texts,
-    )
-    return [e.values for e in result.embeddings]
+    embeddings = []
+    for i in range(0, len(texts), EMBED_BATCH_SIZE):
+        batch = texts[i:i + EMBED_BATCH_SIZE]
+
+        for attempt in range(EMBED_RETRY_LIMIT):
+            try:
+                result = client.models.embed_content(
+                    model=EMBEDDING_MODEL,
+                    contents=batch,
+                )
+                embeddings.extend(e.values for e in result.embeddings)
+                break
+            except Exception as e:
+                if "RESOURCE_EXHAUSTED" in str(e) and attempt < EMBED_RETRY_LIMIT - 1:
+                    wait = 60
+                    print(f"Rate limited, waiting {wait}s before retry...")
+                    time.sleep(wait)
+                else:
+                    raise
+
+        time.sleep(5)  # pace batches so we don't burst the per-minute quota
+
+    return embeddings
 
 @st.cache_data()
 def load_reviews():
