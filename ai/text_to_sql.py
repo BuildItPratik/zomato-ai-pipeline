@@ -1,4 +1,5 @@
 import os
+import re
 
 import pandas as pd
 import snowflake.connector
@@ -12,6 +13,10 @@ from llm import CHAT_MODEL, get_chat_model
 load_dotenv()
 
 FORBIDDEN_WORDS = ['drop', 'delete', 'truncate', 'alter', 'update', 'insert', 'create', 'replace', 'grant', 'revoke']
+
+# Word boundaries, not substrings: a plain `in` check rejects any query that
+# merely mentions a column like created_at or updated_at.
+FORBIDDEN_PATTERN = re.compile(r"\b(" + "|".join(FORBIDDEN_WORDS) + r")\b")
 
 EXAMPLE_QUESTIONS = [
     "Top 10 cities by GMV",
@@ -101,11 +106,7 @@ def is_safe(sql):
     if not lowered.startswith("select") and not lowered.startswith("with"):
         return False
 
-    for word in FORBIDDEN_WORDS:
-        if word in lowered:
-            return False
-
-    return True
+    return FORBIDDEN_PATTERN.search(lowered) is None
 
 def run_query(sql):
     conn = get_connection()
