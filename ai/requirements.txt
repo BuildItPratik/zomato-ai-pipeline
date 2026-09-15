@@ -1,0 +1,13 @@
+# Dependencies for the ai/ scripts (the Zomato/BuildItPratik demo apps).
+# These are separate from the dbt venv and from the Airflow image.
+
+langchain>=1.0
+langchain-openai>=1.0
+
+# Snowflake access. The [pandas] extra is required for fetch_pandas_all().
+snowflake-connector-python[pandas]>=3.0
+pyarrow>=15.0
+
+streamlit>=1.30
+pandas>=2.0
+python-dotenv>=1.0
