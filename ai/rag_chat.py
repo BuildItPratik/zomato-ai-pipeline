@@ -1,26 +1,27 @@
 import os
-import numpy as np
+
 import pandas as pd
-import streamlit as st
 import snowflake.connector
-from google import genai
-from google.genai import types
+import streamlit as st
 from dotenv import load_dotenv
-import time
+from langchain_core.documents import Document
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.vectorstores import InMemoryVectorStore
 
-
+from llm import CHAT_MODEL, EMBEDDING_MODEL, get_chat_model, get_embeddings
 
 load_dotenv()
 
-EMBEDDING_MODEL = "gemini-embedding-001"
-CHAT_MODEL = "gemini-3.6-flash"
 NEW_REVIEWS = 500
-TOK_K = 5
-CACHE_FILE = "review_embeddings.parquet"
-EMBED_BATCH_SIZE = 100
-EMBED_RETRY_LIMIT = 5
+TOP_K = 5
+# Keyed by embedding model so switching models in .env can't silently reuse
+# vectors produced by a different one.
+CACHE_FILE = f"review_embeddings.{EMBEDDING_MODEL.replace('/', '-')}.json"
 
-client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+embeddings = get_embeddings()
+llm = get_chat_model(temperature=0.2)
+
 
 def read_reviews_from_snowflake():
     conn = snowflake.connector.connect(
@@ -44,93 +45,89 @@ def read_reviews_from_snowflake():
     return df
 
 
+def to_native(value):
+    """Snowflake hands back numpy scalars, which json.dump (used by the cache) can't serialize."""
+    return value.item() if hasattr(value, "item") else value
 
-def embed(texts):
-    embeddings = []
-    for i in range(0, len(texts), EMBED_BATCH_SIZE):
-        batch = texts[i:i + EMBED_BATCH_SIZE]
 
-        for attempt in range(EMBED_RETRY_LIMIT):
-            try:
-                result = client.models.embed_content(
-                    model=EMBEDDING_MODEL,
-                    contents=batch,
-                )
-                embeddings.extend(e.values for e in result.embeddings)
-                break
-            except Exception as e:
-                if "RESOURCE_EXHAUSTED" in str(e) and attempt < EMBED_RETRY_LIMIT - 1:
-                    wait = 60
-                    print(f"Rate limited, waiting {wait}s before retry...")
-                    time.sleep(wait)
-                else:
-                    raise
+def reviews_to_documents(df):
+    return [
+        Document(
+            page_content=row.comment,
+            metadata={
+                "review_id": to_native(row.review_id),
+                "city": to_native(row.city),
+                "rating": to_native(row.rating),
+            },
+        )
+        for row in df.itertuples()
+    ]
 
-        time.sleep(5)  # pace batches so we don't burst the per-minute quota
 
-    return embeddings
-
-@st.cache_data()
-def load_reviews():
+@st.cache_resource(show_spinner="Loading and embedding reviews...")
+def load_vector_store():
+    """Load the cached embeddings if we have them, otherwise embed fresh and cache them."""
     if os.path.exists(CACHE_FILE):
-        return pd.read_parquet(CACHE_FILE)
+        return InMemoryVectorStore.load(CACHE_FILE, embedding=embeddings)
 
     df = read_reviews_from_snowflake()
-    df['embedding'] = embed(df['comment'].tolist())
-    df.to_parquet(CACHE_FILE)
-    return df
+    store = InMemoryVectorStore.from_documents(reviews_to_documents(df), embeddings)
+    store.dump(CACHE_FILE)
+    return store
+
+
+ANSWER_PROMPT = ChatPromptTemplate.from_messages(
+    [
+        (
+            "system",
+            "Answer ONLY using the customer reviews provided. "
+            "Be concise. If the reviews don't cover it, say so.",
+        ),
+        ("user", "Question: {question}\n\nReviews:\n{context}"),
+    ]
+)
+
+answer_chain = ANSWER_PROMPT | llm | StrOutputParser()
+
+
+def format_reviews(documents):
+    return "\n".join(
+        f" ({doc.metadata['city']}, {doc.metadata['rating']} stars) {doc.page_content}"
+        for doc in documents
+    )
+
+
+def ask_llm(question, documents):
+    return answer_chain.invoke(
+        {"question": question, "context": format_reviews(documents)}
+    )
+
 
 st.title("Chat with your Zomato Reviews")
-st.caption(f"Searching {NEW_REVIEWS} review, answering with {CHAT_MODEL} model")
+st.caption(f"Searching {NEW_REVIEWS} reviews, answering with {CHAT_MODEL} model")
 
-def consine_simiarity(vec_a, vec_b):
-    return np.dot(vec_a, vec_b) / (np.linalg.norm(vec_a) * np.linalg.norm(vec_b))
-
-def find_similar_reviews(question, df):
-    question_vector = embed([question])[0]
-
-    scores = []
-    for review_vector in df['embedding']:
-        scores.append(consine_simiarity(question_vector, review_vector))
-
-    df = df.copy()
-    df['score'] = scores
-    return df.nlargest(TOK_K, 'score')
-
-def ask_llm(question, top_reviews):
-    conext = ""
-
-    for _, row in top_reviews.iterrows():
-        conext += f" ({row['city']}, {row['rating']} stars) {row['comment']}\n"
-
-    system_prompt = (
-        "Answer ONLY using the customer reviews provided. "
-        "Be concise. If the reviews don't covert it, say so"
-    )
-
-    user_prompt = f"Questions: {question}\n\nReviews:\n{conext}"
-
-    response = client.models.generate_content(
-        model=CHAT_MODEL,
-        contents=user_prompt,
-        config=types.GenerateContentConfig(
-            system_instruction=system_prompt,
-            temperature=0.2,
-        ),
-    )
-    return response.text
-
-review_df = load_reviews()
+vector_store = load_vector_store()
+retriever = vector_store.as_retriever(search_kwargs={"k": TOP_K})
 
 question = st.text_input("Ask a question about your reviews:",
                          placeholder="e.g. What are the most common complaints about delivery?")
 
 if question:
-    top_reviews = find_similar_reviews(question, review_df)
+    top_reviews = retriever.invoke(question)
     answer = ask_llm(question, top_reviews)
 
     st.markdown(f"**Answer:**")
     st.write(answer)
 
     with st.expander("Reviews used to build this answer"):
-        st.dataframe(top_reviews[['city', 'rating', 'comment']], hide_index=True)
+        st.dataframe(
+            pd.DataFrame([
+                {
+                    "city": doc.metadata["city"],
+                    "rating": doc.metadata["rating"],
+                    "comment": doc.page_content,
+                }
+                for doc in top_reviews
+            ]),
+            hide_index=True,
+        )
