@@ -1,35 +1,64 @@
 import os
-import json
+from typing import Literal, get_args
+
 import snowflake.connector
-from google import genai
-from google.genai import types
 from dotenv import load_dotenv
+from langchain_core.prompts import ChatPromptTemplate
+from pydantic import BaseModel, Field
+
+from llm import CHAT_MODEL, get_chat_model
 
 load_dotenv()
 
-MODEL = "gemini-3.6-flash"
-
 SAMPLE_N = 5
-TOPICS = ["food quality", "delivery", "pricing", "service", "packaging", "other"]
 
-client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+# The Literal is the source of truth: it becomes an enum in the tool schema the
+# model has to pick from, and TOPICS is derived from it for the prompt text.
+Topic = Literal["food quality", "delivery", "pricing", "service", "packaging", "other"]
+TOPICS = list(get_args(Topic))
+
+
+class ReviewLabels(BaseModel):
+    """The classification we want back for a single customer review."""
+
+    sentiment_label: Literal["positive", "negative", "neutral"] = Field(
+        description="Overall sentiment of the review"
+    )
+    sentiment_score: float = Field(
+        ge=-1.0,
+        le=1.0,
+        description="Sentiment strength from -1.0 (very negative) to 1.0 (very positive)",
+    )
+    topic: Topic = Field(description="Main topic the review is about")
+    key_issue: str | None = Field(
+        default=None,
+        description="Short phrase of 6 words or less describing the main issue, or null if there is none",
+    )
+
 
 SYSTEM_PROMPT = f"""
 You classify customer reviews for a food delivery app.
 
-For the review you are given, return:
+Read the review you are given and work out:
 - sentiment_label: positive, negative, or neutral
 - sentiment_score: a number between -1.0 and 1.0
-- topic: one of {TOPICS}
+- topic: the main topic, one of {TOPICS}
 - key_issue: a short phrase of 6 words or less that describes the main issue in the review, if any. If there is no issue, return null
-
-Reply as JSON in this exact format:
-{{
-    "sentiment_label": "<sentiment_label>",
-    "sentiment_score": <sentiment_score>,
-    "topic": "<topic>",
-    "key_issue": "<key_issue>"}}
 """
+
+prompt = ChatPromptTemplate.from_messages(
+    [
+        ("system", SYSTEM_PROMPT),
+        ("user", "{comment}"),
+    ]
+)
+
+# temperature=0 keeps the labels stable across runs; with_structured_output makes
+# the model return a ReviewLabels object instead of a JSON blob we parse by hand.
+llm = get_chat_model(temperature=0).with_structured_output(ReviewLabels)
+
+classify_chain = prompt | llm
+
 
 def get_connection():
     return snowflake.connector.connect(
@@ -65,16 +94,7 @@ def get_reviews_to_enrich(cursor):
     return cursor.fetchall()
 
 def classify_review(comment):
-    response = client.models.generate_content(
-        model=MODEL,
-        contents=comment,
-        config=types.GenerateContentConfig(
-            system_instruction=SYSTEM_PROMPT,
-            temperature=0,
-            response_mime_type="application/json",
-        ),
-    )
-    return json.loads(response.text)
+    return classify_chain.invoke({"comment": comment})
 
 def save_results(cursor, results):
     """Insert all the enriched rows into Snowflake in one go."""
@@ -101,22 +121,28 @@ def main():
 
     print(f"Enriching {len(reviews)} reviews...")
 
+    # .batch() runs the chain over every review and return_exceptions keeps one bad
+    # review from sinking the whole run.
+    labels = classify_chain.batch(
+        [{"comment": comment} for _, comment in reviews],
+        return_exceptions=True,
+    )
+
     results = []
-    for review_id, comment in reviews:
-        print(f"Classifying review {review_id}: {comment}")
-        try:
-            labels = classify_review(comment)
-            print(f"Labels for review {review_id}: {labels}")
-            results.append((
-                review_id,
-                labels["sentiment_label"],
-                labels["sentiment_score"],
-                labels["topic"],
-                labels["key_issue"],
-                MODEL
-            ))
-        except Exception as e:
-            print(f"Error occurred while classifying review {review_id}: {e}")
+    for (review_id, _), label in zip(reviews, labels):
+        if isinstance(label, Exception):
+            print(f"Error occurred while classifying review {review_id}: {label}")
+            continue
+
+        print(f"Labels for review {review_id}: {label}")
+        results.append((
+            review_id,
+            label.sentiment_label,
+            label.sentiment_score,
+            label.topic,
+            label.key_issue,
+            CHAT_MODEL
+        ))
 
     save_results(cursor, results)
     print(f"Saved {len(results)} enriched reviews to Snowflake.")
