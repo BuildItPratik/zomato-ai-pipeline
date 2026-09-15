@@ -16,11 +16,20 @@ x-airflow-common: &airflow-common
     # CRITICAL in multi-container Airflow 3: tasks reach the Execution API by the api-server's
     # SERVICE NAME, not localhost. Without this, tasks die → "state mismatch ... failed".
     AIRFLOW__CORE__EXECUTION_API_SERVER_URL: 'http://apiserver:8080/execution/'
-    # dbt + the AI task read these:
+    # dbt + the AI task read these. The ai/ scripts connect directly instead of
+    # going through conn_id, so they need warehouse/database/schema too.
     SNOWFLAKE_ACCOUNT: ${SNOWFLAKE_ACCOUNT}
     SNOWFLAKE_USER: ${SNOWFLAKE_USER}
     SNOWFLAKE_PASSWORD: ${SNOWFLAKE_PASSWORD}
-    OPENAI_API_KEY: ${OPENAI_API_KEY}
+    SNOWFLAKE_WAREHOUSE: ${SNOWFLAKE_WAREHOUSE:-ZOMATO_WH}
+    SNOWFLAKE_DATABASE: ${SNOWFLAKE_DATABASE:-ZOMATO}
+    SNOWFLAKE_SCHEMA: ${SNOWFLAKE_SCHEMA:-RAW}
+    # ai/llm.py routes through OpenRouter, which speaks the OpenAI wire format.
+    # These are NOT OpenAI keys - a real OPENAI_API_KEY will not authenticate.
+    OPENROUTER_API_KEY: ${OPENROUTER_API_KEY}
+    OPENROUTER_BASE_URL: ${OPENROUTER_BASE_URL:-https://openrouter.ai/api/v1}
+    OPENROUTER_CHAT_MODEL: ${OPENROUTER_CHAT_MODEL:-openai/gpt-4o-mini}
+    OPENROUTER_EMBEDDING_MODEL: ${OPENROUTER_EMBEDDING_MODEL:-openai/text-embedding-3-small}
     SAMPLE_N: ${SAMPLE_N:-5}
     AIRFLOW_CONN_SNOWFLAKE_DEFAULT: '{"conn_type":"snowflake","login":"${SNOWFLAKE_USER}","password":"${SNOWFLAKE_PASSWORD}","schema":"RAW","extra":{"account":"${SNOWFLAKE_ACCOUNT}","warehouse":"ZOMATO_WH","database":"ZOMATO","role":"DBT_ROLE"}}'
   volumes:
